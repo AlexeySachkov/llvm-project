@@ -140,6 +140,7 @@ private:
   Address prepareKernelArgs(CodeGenFunction &CGF, FunctionArgList &Args);
   Address prepareKernelArgsLLVMOffload(CodeGenFunction &CGF,
                                        FunctionArgList &Args);
+  std::pair<Address, size_t> prepareKernelArgsHIPBundled(CodeGenFunction &CGF, FunctionArgList &Args);
   void emitDeviceStubBodyLegacy(CodeGenFunction &CGF, FunctionArgList &Args);
   void emitDeviceStubBodyNew(CodeGenFunction &CGF, FunctionArgList &Args);
   std::string getDeviceSideName(const NamedDecl *ND) override;
@@ -385,14 +386,47 @@ Address CGNVCUDARuntime::prepareKernelArgs(CodeGenFunction &CGF,
   return KernelArgs;
 }
 
+std::pair<Address, size_t> CGNVCUDARuntime::prepareKernelArgsHIPBundled(CodeGenFunction &CGF,
+    FunctionArgList &Args) {
+  size_t TotalSize = 0;
+  for (unsigned i = 0; i < Args.size(); ++i) {
+    Address Arg = CGF.GetAddrOfLocalVar(Args[i]);
+    TotalSize = llvm::alignTo(TotalSize, Arg.getAlignment().getQuantity());
+    TotalSize += CGM.getDataLayout().getTypeAllocSize(Arg.getElementType());
+  }
+  Address KernelArgs = CGF.CreateTempAlloca(
+      llvm::Type::getInt8Ty(CGF.getLLVMContext()), CharUnits::fromQuantity(16), "kernel_args_bundled",
+      llvm::ConstantInt::get(SizeTy, std::max<size_t>(1, TotalSize)));
+  size_t Offset = 0;
+  for (unsigned i = 0; i < Args.size(); ++i) {
+    Address Arg = CGF.GetAddrOfLocalVar(Args[i]);
+    Offset = llvm::alignTo(Offset, Arg.getAlignment().getQuantity());
+    llvm::Value *VarPtr = Arg.emitRawPointer(CGF);
+    llvm::Value *VoidVarPtr = CGF.Builder.CreatePointerCast(VarPtr, PtrTy);
+    llvm::Value *GEP = CGF.Builder.CreateConstGEP1_32(
+                        llvm::Type::getInt8Ty(CGF.getLLVMContext()), KernelArgs.emitRawPointer(CGF), Offset);
+    llvm::MaybeAlign DestAlign(CGM.getDataLayout().getTypeAllocSize(Arg.getElementType()));
+    CGF.Builder.CreateMemCpy(GEP, DestAlign, VoidVarPtr, llvm::MaybeAlign{Arg.getAlignment().getQuantity()}, CGM.getDataLayout().getTypeAllocSize(Arg.getElementType()));
+    Offset += CGM.getDataLayout().getTypeAllocSize(Arg.getElementType());
+  }
+
+  return {KernelArgs, TotalSize};
+}
+
+
 // CUDA 9.0+ uses new way to launch kernels. Parameters are packed in a local
 // array and kernels are launched using cudaLaunchKernel().
 void CGNVCUDARuntime::emitDeviceStubBodyNew(CodeGenFunction &CGF,
                                             FunctionArgList &Args) {
   // Build the shadow stack entry at the very start of the function.
-  Address KernelArgs = CGF.getLangOpts().OffloadViaLLVM
-                           ? prepareKernelArgsLLVMOffload(CGF, Args)
-                           : prepareKernelArgs(CGF, Args);
+  std::pair<Address, size_t> Temp
+     = CGF.getLangOpts().OffloadViaLLVM
+                           ? std::pair{prepareKernelArgsLLVMOffload(CGF, Args), size_t{0}}
+                           : CGF.getLangOpts().HIP
+                           ? prepareKernelArgsHIPBundled(CGF, Args)
+                           : std::pair{prepareKernelArgs(CGF, Args), size_t{0}};
+  Address KernelArgs = Temp.first;
+  size_t KernelArgsSize = Temp.second;
 
   llvm::BasicBlock *EndBlock = CGF.createBasicBlock("setup.end");
 
@@ -409,6 +443,8 @@ void CGNVCUDARuntime::emitDeviceStubBodyNew(CodeGenFunction &CGF,
   TranslationUnitDecl *TUDecl = CGM.getContext().getTranslationUnitDecl();
   DeclContext *DC = TranslationUnitDecl::castToDeclContext(TUDecl);
   std::string KernelLaunchAPI = "LaunchKernel";
+  if (CGF.getLangOpts().HIP)
+    KernelLaunchAPI += "BundledArgs";
   if (CGF.getLangOpts().GPUDefaultStream ==
       LangOptions::GPUDefaultStreamKind::PerThread) {
     if (CGF.getLangOpts().HIP)
@@ -462,12 +498,23 @@ void CGNVCUDARuntime::emitDeviceStubBodyNew(CodeGenFunction &CGF,
                        cudaLaunchKernelFD->getParamDecl(0)->getType());
   LaunchKernelArgs.add(RValue::getAggregate(GridDim), Dim3Ty);
   LaunchKernelArgs.add(RValue::getAggregate(BlockDim), Dim3Ty);
-  LaunchKernelArgs.add(RValue::get(KernelArgs, CGF),
-                       cudaLaunchKernelFD->getParamDecl(3)->getType());
-  LaunchKernelArgs.add(RValue::get(CGF.Builder.CreateLoad(ShmemSize)),
-                       cudaLaunchKernelFD->getParamDecl(4)->getType());
-  LaunchKernelArgs.add(RValue::get(CGF.Builder.CreateLoad(Stream)),
-                       cudaLaunchKernelFD->getParamDecl(5)->getType());
+  if (CGF.getLangOpts().HIP) {
+    LaunchKernelArgs.add(RValue::get(KernelArgs, CGF),
+                         cudaLaunchKernelFD->getParamDecl(3)->getType());
+    LaunchKernelArgs.add(RValue::get(llvm::ConstantInt::get(CGM.Int64Ty, KernelArgsSize)),
+                         cudaLaunchKernelFD->getParamDecl(4)->getType());
+    LaunchKernelArgs.add(RValue::get(CGF.Builder.CreateLoad(ShmemSize)),
+                         cudaLaunchKernelFD->getParamDecl(5)->getType());
+    LaunchKernelArgs.add(RValue::get(CGF.Builder.CreateLoad(Stream)),
+                         cudaLaunchKernelFD->getParamDecl(6)->getType());
+  } else {
+    LaunchKernelArgs.add(RValue::get(KernelArgs, CGF),
+                         cudaLaunchKernelFD->getParamDecl(3)->getType());
+    LaunchKernelArgs.add(RValue::get(CGF.Builder.CreateLoad(ShmemSize)),
+                         cudaLaunchKernelFD->getParamDecl(4)->getType());
+    LaunchKernelArgs.add(RValue::get(CGF.Builder.CreateLoad(Stream)),
+                         cudaLaunchKernelFD->getParamDecl(5)->getType());
+  }
 
   QualType QT = cudaLaunchKernelFD->getType();
   QualType CQT = QT.getCanonicalType();

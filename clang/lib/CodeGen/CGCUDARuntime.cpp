@@ -138,6 +138,7 @@ RValue CGCUDARuntime::EmitCUDAKernelCallExpr(CodeGenFunction &CGF,
   CodeGenFunction::ConditionalEvaluation eval(CGF);
   CGF.EmitBranchOnBoolExpr(E->getConfig(), ContBlock, ConfigOKBlock,
                            /*TrueCount=*/0);
+  // E->dump();
 
   eval.begin(CGF);
   CGF.EmitBlock(ConfigOKBlock);
